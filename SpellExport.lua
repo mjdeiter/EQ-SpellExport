@@ -1,13 +1,19 @@
 -- Project Lazarus Spell Scanner - LUA VERSION
 -- Works with MacroQuest EMU (E3Next) on Project Lazarus
-
+-- This version uses Lua file I/O which DOES work in MQNext
 
 local mq = require('mq')
 
 -- Configuration
 local MAX_SPELL_ID = 30000
 local PROGRESS_INTERVAL = 1000
-local OUTPUT_DIR = "C:/Games/Project_Lazarus/E3NextAndMQNextBinary-main/"
+
+-- Auto-detect MacroQuest path
+local OUTPUT_DIR = mq.TLO.MacroQuest.Path() or "C:/Games/Project_Lazarus/E3NextAndMQNextBinary-main/"
+-- Ensure path ends with forward slash
+if not OUTPUT_DIR:match("/$") then
+    OUTPUT_DIR = OUTPUT_DIR .. "/"
+end
 
 -- Counters
 local spellsProcessed = 0
@@ -45,19 +51,25 @@ end
 
 -- Initialize files
 local function initializeFiles()
+    print("Attempting to create files in: " .. OUTPUT_DIR)
+    
     -- Create CSV with header
-    local f = io.open(csvFile, "w")
+    local f, err = io.open(csvFile, "w")
     if not f then
         print("ERROR: Could not create CSV file: " .. csvFile)
+        print("Error message: " .. tostring(err))
+        print("Check that the directory exists and you have write permissions")
         return false
     end
     f:write("Spell_ID,Spell_Name,Level,Spell_Type,Target_Type,Mana_Cost,Cast_Time,Duration,Spell_Range,Status\n")
     f:close()
+    print("CSV file created successfully")
     
     -- Create log file
-    f = io.open(logFile, "w")
+    f, err = io.open(logFile, "w")
     if not f then
         print("ERROR: Could not create log file: " .. logFile)
+        print("Error message: " .. tostring(err))
         return false
     end
     f:write("===============================================\n")
@@ -67,6 +79,7 @@ local function initializeFiles()
     f:write(string.format("Scanning spell IDs 1 to %d\n", MAX_SPELL_ID))
     f:write("===============================================\n")
     f:close()
+    print("LOG file created successfully")
     
     return true
 end
@@ -221,6 +234,7 @@ end
 print("===============================================")
 print("Project Lazarus Spell Scanner (Lua Version)")
 print(string.format("Character: %s (%s %d)", charName, className, charLevel))
+print("Output directory: " .. OUTPUT_DIR)
 print("===============================================")
 print("CSV: " .. csvFile)
 print("LOG: " .. logFile)
