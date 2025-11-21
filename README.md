@@ -62,7 +62,7 @@ The CSV file includes the following information for each missing spell:
    - `<CharName>_<Class>_Spells_<Timestamp>.csv`
    - `<CharName>_<Class>_Log_<Timestamp>.txt`
 
-## 📖 Example Output
+##  Example Output
 
 ### Console Output:
 ```
@@ -98,7 +98,7 @@ Spell_ID,Spell_Name,Level,Spell_Type,Target_Type,Mana_Cost,Cast_Time,Duration,Sp
 ...
 ```
 
-## ⚙️ Configuration
+##  Configuration
 
 The script includes a few configurable options at the top of the file:
 
@@ -163,8 +163,3 @@ This project is provided as-is for use with Project Lazarus EverQuest. Feel free
 - **E3Next** contributors for the enhanced MacroQuest binary
 - Community members who helped test and debug
 - This is originally not my work. I just improved on it. Author unknown. The original versions of this script attempted to use MacroQuest's macro scripting language, but encountered a critical limitation: **MacroQuest EMU does not support file I/O operations** in its macro language. Commands like `/fileprint` and `/logfile` don't exist, and shell redirection (`/echo > file`) is not supported. **Lua**, however, has full file I/O support through standard Lua libraries (`io.open()`, `file:write()`, etc.), making it the ideal solution for this tool.
-
-
----
-
-**Happy spell hunting!** 🧙‍♂️✨
