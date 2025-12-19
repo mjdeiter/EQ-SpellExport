@@ -1,252 +1,374 @@
--- Project Lazarus Spell Scanner - LUA VERSION
--- Works with MacroQuest EMU (E3Next) on Project Lazarus
--- This version uses Lua file I/O which DOES work in MQNext
+-- ======================================================================
+-- SpellExport v1.4.0
+-- Project Lazarus Spell Export Tool
+--
+-- v1.4.0
+--  • Removed ability type labels feature (non-functional)
+-- v1.3.0
+--  • Added tooltips for all buttons and checkboxes
+-- v1.2.0
+--  • Removed Type column from CSV export
+-- v1.1.0
+--  • Ability type labeling (Spell / Discipline / Ability / Hybrid)
+--  • Type column always included in CSV
+--  • Hide spellbook spells filter
+--  • Filters apply to GUI and CSV consistently
+--  • Clear, locked checkbox labels
+-- ======================================================================
 
-local mq = require('mq')
+-----------------------------
+-- Script Identity
+-----------------------------
+local SCRIPT_NAME    = "SpellExport"
+local SCRIPT_VERSION = "v1.4.0"
 
--- Configuration
-local MAX_SPELL_ID = 30000
-local PROGRESS_INTERVAL = 1000
+-----------------------------
+-- Libraries
+-----------------------------
+local mq    = require('mq')
+local ImGui = require('ImGui')
 
--- Auto-detect MacroQuest path
-local OUTPUT_DIR = mq.TLO.MacroQuest.Path() or "C:/Games/Project_Lazarus/E3NextAndMQNextBinary-main/"
--- Ensure path ends with forward slash
-if not OUTPUT_DIR:match("/$") then
-    OUTPUT_DIR = OUTPUT_DIR .. "/"
+-----------------------------
+-- Constants
+-----------------------------
+local MAX_SPELL_ID  = 30000
+local SCAN_BATCH    = 150
+local DELAY_MS      = 1
+local SETTINGS_FILE = "SpellExport_settings.lua"
+
+-----------------------------
+-- State
+-----------------------------
+local scanning, scan_complete, terminate = false, false, false
+local currentScanID, scanStartTime = 1, 0
+local spellsProcessed, missingCount = 0, 0
+local missingSpells = {}
+
+-----------------------------
+-- Helpers
+-----------------------------
+local function safe(fn)
+    local ok, r = pcall(fn)
+    if ok then return r end
 end
 
--- Counters
-local spellsProcessed = 0
-local validSpells = 0
-local classLevelSpells = 0
-local spellsKnown = 0
-local missingSpells = 0
-local missingData = {}
+local function tonum(v) return tonumber(v) or 0 end
 
--- Get timestamp for filenames
-local function getTimestamp()
-    return os.date("%Y_%m_%d_%H%M%S")
+local function normalizePath(p)
+    if not p then return nil end
+    p = tostring(p):gsub("\\","/"):gsub("%s+$","")
+    if not p:match("/$") then p = p .. "/" end
+    return p
 end
 
--- Get character info
-local charName = mq.TLO.Me.CleanName()
-local className = mq.TLO.Me.Class.Name()
-local classID = mq.TLO.Me.Class.ID()
-local charLevel = mq.TLO.Me.Level()
-local timestamp = getTimestamp()
+local function mqLogs()
+    return tostring(mq.TLO.MacroQuest.Path() or ".") .. "/Logs/"
+end
 
--- Build file paths
-local csvFile = string.format("%s%s_%s_Spells_%s.csv", OUTPUT_DIR, charName, className, timestamp)
-local logFile = string.format("%s%s_%s_Log_%s.txt", OUTPUT_DIR, charName, className, timestamp)
+local function scriptDir()
+    return tostring(mq.TLO.MacroQuest.Path() or ".") .. "/"
+end
 
--- Logging function
-local function log(message)
-    print(message)
-    local f = io.open(logFile, "a")
-    if f then
-        f:write(string.format("[%s] %s\n", os.date("%H:%M:%S"), message))
-        f:close()
+local function getCharName()
+    return safe(function() return mq.TLO.Me.CleanName() end)
+        or safe(function() return mq.TLO.Me.Name() end)
+        or "Unknown"
+end
+
+local function tooltip(text)
+    if ImGui.IsItemHovered() then
+        ImGui.SetTooltip(text)
     end
 end
 
--- Initialize files
-local function initializeFiles()
-    print("Attempting to create files in: " .. OUTPUT_DIR)
-    
-    -- Create CSV with header
-    local f, err = io.open(csvFile, "w")
-    if not f then
-        print("ERROR: Could not create CSV file: " .. csvFile)
-        print("Error message: " .. tostring(err))
-        print("Check that the directory exists and you have write permissions")
-        return false
+-----------------------------
+-- Dynamic Character State
+-----------------------------
+local classID, charLevel = 0, 1
+
+local function refreshCharacterState()
+    classID   = tonum(safe(function() return mq.TLO.Me.Class.ID() end))
+    charLevel = tonum(safe(function() return mq.TLO.Me.Level() end))
+end
+
+-----------------------------
+-- UI / Persisted State
+-----------------------------
+local filterMinLevel = 0
+local filterMaxLevel = 1
+
+local showInGUI      = true
+local exportCSV      = true
+local hideSpellbook  = false
+
+local outputDir = mqLogs()
+
+-----------------------------
+-- Settings
+-----------------------------
+local function settingsPath()
+    return normalizePath(outputDir) .. SETTINGS_FILE
+end
+
+local function loadSettings()
+    local f = loadfile(settingsPath())
+    if not f then return end
+    local ok, d = pcall(f)
+    if ok and type(d) == "table" then
+        filterMinLevel = tonum(d.minLevel)
+        filterMaxLevel = tonum(d.maxLevel)
+        showInGUI      = d.showInGUI ~= false
+        exportCSV      = d.exportCSV ~= false
+        hideSpellbook  = d.hideSpellbook == true
+        outputDir      = d.outputDir or outputDir
     end
-    f:write("Spell_ID,Spell_Name,Level,Spell_Type,Target_Type,Mana_Cost,Cast_Time,Duration,Spell_Range,Status\n")
+end
+
+local function saveSettings()
+    local f = io.open(settingsPath(), "w")
+    if not f then return end
+    f:write("return {\n")
+    f:write(string.format(" minLevel=%d,\n", filterMinLevel))
+    f:write(string.format(" maxLevel=%d,\n", filterMaxLevel))
+    f:write(string.format(" showInGUI=%s,\n", tostring(showInGUI)))
+    f:write(string.format(" exportCSV=%s,\n", tostring(exportCSV)))
+    f:write(string.format(" hideSpellbook=%s,\n", tostring(hideSpellbook)))
+    f:write(string.format(" outputDir=%q,\n", normalizePath(outputDir)))
+    f:write("}\n")
     f:close()
-    print("CSV file created successfully")
-    
-    -- Create log file
-    f, err = io.open(logFile, "w")
-    if not f then
-        print("ERROR: Could not create log file: " .. logFile)
-        print("Error message: " .. tostring(err))
-        return false
-    end
-    f:write("===============================================\n")
-    f:write(string.format("Project Lazarus Spell Scanner\n"))
-    f:write(string.format("Character: %s (%s Level %d)\n", charName, className, charLevel))
-    f:write(string.format("Timestamp: %s\n", timestamp))
-    f:write(string.format("Scanning spell IDs 1 to %d\n", MAX_SPELL_ID))
-    f:write("===============================================\n")
-    f:close()
-    print("LOG file created successfully")
-    
-    return true
 end
 
--- Get spell type by ID range
-local function getSpellType(spellID)
-    if spellID <= 999 then
-        return "Original"
-    elseif spellID <= 2999 then
-        return "Kunark"
-    elseif spellID <= 3999 then
-        return "Velious"
-    elseif spellID <= 4999 then
-        return "Luclin"
-    else
-        return "Later_Expansion"
+-----------------------------
+-- Ability Type Classification
+-----------------------------
+local function classify(spell)
+    local name = spell.Name()
+    local id   = spell.ID()
+
+    local isBook   = safe(function() return mq.TLO.Me.Book(name)() end)
+    local isSpell  = safe(function() return mq.TLO.Me.Spell(id)() end)
+    local isAbil   = safe(function() return mq.TLO.Me.Ability(name)() end)
+    local isCombat = safe(function() return mq.TLO.Me.CombatAbility(name)() end)
+
+    local hits = 0
+    for _, v in pairs({isBook, isSpell, isAbil, isCombat}) do
+        if v then hits = hits + 1 end
     end
+
+    if hits > 1 then return "Hybrid" end
+    if isCombat then return "Discipline" end
+    if isAbil then return "Ability" end
+    if isBook or isSpell then return "Spell" end
+    return "Unknown"
 end
 
--- Check a single spell
-local function checkSpell(spellID)
-    spellsProcessed = spellsProcessed + 1
-    
-    -- Get spell object
-    local spell = mq.TLO.Spell(spellID)
-    
-    -- Check if spell exists
-    if not spell or not spell.ID() or spell.ID() == 0 then
-        return -- Invalid spell ID
-    end
-    
-    local spellName = spell.Name()
-    if not spellName or spellName == "NULL" or spellName == "" then
-        return -- Invalid spell
-    end
-    
-    validSpells = validSpells + 1
-    
-    -- Check if it's for our class and level
-    local spellLevel = spell.Level(classID)() or 0
-    if spellLevel <= 0 or spellLevel > charLevel then
-        return -- Not for our class or too high level
-    end
-    
-    classLevelSpells = classLevelSpells + 1
-    
-    -- Check if we know this spell
-    local isKnown = mq.TLO.Me.Book(spellName)() ~= nil
-    
-    if isKnown then
-        spellsKnown = spellsKnown + 1
-    else
-        -- We don't know it - add to missing list
-        missingSpells = missingSpells + 1
-        
-        -- Get additional spell info
-        local spellType = spell.SpellType() or getSpellType(spellID)
-        local targetType = spell.TargetType() or "Unknown"
-        local manaCost = spell.Mana() or 0
-        local castTime = spell.CastTime() or 0
-        local duration = spell.Duration() or 0
-        local spellRange = spell.Range() or 0
-        
-        -- Store data
-        table.insert(missingData, {
-            id = spellID,
-            name = spellName:gsub('"', "'"), -- Replace quotes
-            level = spellLevel,
-            spellType = spellType,
-            targetType = targetType,
-            mana = manaCost,
-            castTime = castTime,
-            duration = duration,
-            range = spellRange
-        })
-    end
-end
-
--- Main scan function
-local function scanSpells()
-    log("Starting spell scan...")
-    print(string.format("Scanning %d spell IDs - this will take 2-5 minutes", MAX_SPELL_ID))
-    
-    local startTime = os.clock()
-    
-    for i = 1, MAX_SPELL_ID do
-        checkSpell(i)
-        
-        -- Progress update
-        if i % PROGRESS_INTERVAL == 0 then
-            local message = string.format("Processed %d/%d | Valid: %d | Class/Level: %d | Known: %d | Missing: %d",
-                i, MAX_SPELL_ID, validSpells, classLevelSpells, spellsKnown, missingSpells)
-            print(message)
-            log(message)
-        end
-        
-        -- Yield periodically to prevent freezing
-        if i % 100 == 0 then
-            mq.delay(1)
-        end
-    end
-    
-    local elapsed = os.clock() - startTime
-    log(string.format("Scan complete in %.2f seconds", elapsed))
-end
-
--- Write results to CSV
-local function writeResults()
-    log("Writing results to CSV...")
-    
-    local f = io.open(csvFile, "a")
-    if not f then
-        print("ERROR: Could not open CSV for writing")
-        return false
-    end
-    
-    for _, spell in ipairs(missingData) do
-        f:write(string.format('%d,"%s",%d,"%s","%s",%d,%d,%d,%d,Missing\n',
-            spell.id, spell.name, spell.level, spell.spellType, spell.targetType,
-            spell.mana, spell.castTime, spell.duration, spell.range))
-    end
-    
-    f:close()
-    return true
-end
-
--- Print summary
-local function printSummary()
-    local summary = [[
-===============================================
-SPELL SCAN COMPLETE
-===============================================
-Total spell IDs processed: %d
-Valid spells in database: %d
-Spells for your class/level: %d
- - Spells you know: %d
- - Missing spells: %d
-===============================================
-CSV File: %s
-LOG File: %s
-===============================================
-]]
-    
-    local message = string.format(summary, spellsProcessed, validSpells, classLevelSpells,
-        spellsKnown, missingSpells, csvFile, logFile)
-    
-    print(message)
-    log(message)
-end
-
--- Main execution
-print("===============================================")
-print("Project Lazarus Spell Scanner (Lua Version)")
-print(string.format("Character: %s (%s %d)", charName, className, charLevel))
-print("Output directory: " .. OUTPUT_DIR)
-print("===============================================")
-print("CSV: " .. csvFile)
-print("LOG: " .. logFile)
-print("===============================================")
-
-if not initializeFiles() then
-    print("Failed to initialize files. Aborting.")
+local function isKnown(spell)
     return
+        safe(function() return mq.TLO.Me.Book(spell.Name())() end) or
+        safe(function() return mq.TLO.Me.Book(spell.ID())() end) or
+        safe(function() return mq.TLO.Me.Spell(spell.ID())() end) or
+        safe(function() return mq.TLO.Me.Ability(spell.Name())() end) or
+        safe(function() return mq.TLO.Me.CombatAbility(spell.Name())() end) or
+        false
 end
 
-scanSpells()
-writeResults()
-printSummary()
+-----------------------------
+-- Scan Logic
+-----------------------------
+local function resetScan()
+    spellsProcessed, missingCount = 0, 0
+    missingSpells = {}
+    currentScanID = 1
+    scanning, scan_complete = false, false
+end
 
-print("Script complete!")
+local function startScan()
+    resetScan()
+    refreshCharacterState()
+
+    filterMinLevel = math.max(0, math.min(filterMinLevel, charLevel))
+    filterMaxLevel = math.max(filterMinLevel, math.min(filterMaxLevel, charLevel))
+
+    scanning = true
+    scanStartTime = os.clock()
+
+    print(string.format(
+        "[%s] Scan started for %s (%d–%d)",
+        SCRIPT_NAME, getCharName(), filterMinLevel, filterMaxLevel
+    ))
+end
+
+local function processBatch()
+    local endID = math.min(currentScanID + SCAN_BATCH - 1, MAX_SPELL_ID)
+
+    for id = currentScanID, endID do
+        spellsProcessed = spellsProcessed + 1
+        local sp = safe(function() return mq.TLO.Spell(id) end)
+        if sp and sp.ID() and sp.ID() ~= 0 then
+            local lvl = tonum(sp.Level(classID)())
+            if lvl >= filterMinLevel and lvl <= filterMaxLevel then
+                if not isKnown(sp) then
+                    local t = classify(sp)
+                    if not (hideSpellbook and t == "Spell") then
+                        missingCount = missingCount + 1
+                        table.insert(missingSpells, {
+                            id=id, name=sp.Name(), level=lvl, type=t
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    if spellsProcessed % 1000 == 0 then
+        print(string.format(
+            "[%s] %d/%d scanned | Missing: %d",
+            SCRIPT_NAME, spellsProcessed, MAX_SPELL_ID, missingCount
+        ))
+    end
+
+    currentScanID = endID + 1
+
+    if currentScanID > MAX_SPELL_ID then
+        scanning = false
+        scan_complete = true
+        print(string.format(
+            "[%s] Scan complete for %s. Missing: %d",
+            SCRIPT_NAME, getCharName(), missingCount
+        ))
+        if exportCSV then exportToCSV() end
+    end
+end
+
+-----------------------------
+-- CSV Export
+-----------------------------
+function exportToCSV()
+    local charName = getCharName()
+    local base = normalizePath(outputDir) or mqLogs()
+
+    local path = string.format(
+        "%s%s_MissingSpells_%s.csv",
+        base,
+        charName:gsub("%s+","_"),
+        os.date("%Y-%m-%d_%H%M")
+    )
+
+    local f = io.open(path, "w")
+    if not f then
+        print(string.format("[%s] ERROR: Failed to write CSV", SCRIPT_NAME))
+        return
+    end
+
+    f:write("ID,Name,Level\n")
+    for _, s in ipairs(missingSpells) do
+        f:write(string.format(
+            '%d,"%s",%d\n',
+            s.id,
+            s.name:gsub('"','""'),
+            s.level
+        ))
+    end
+    f:close()
+
+    print(string.format("[%s] CSV written: %s", SCRIPT_NAME, path))
+end
+
+-----------------------------
+-- ETA
+-----------------------------
+local function ETA()
+    if not scanning or spellsProcessed == 0 then return "Calculating..." end
+    local avg = (os.clock() - scanStartTime) / spellsProcessed
+    local remain = math.max(0, MAX_SPELL_ID - currentScanID)
+    local sec = math.floor(avg * remain)
+    return string.format("~%dm %ds", math.floor(sec / 60), sec % 60)
+end
+
+-----------------------------
+-- GUI
+-----------------------------
+local function drawGUI()
+    local _, open = ImGui.Begin(SCRIPT_NAME .. " " .. SCRIPT_VERSION, true)
+    if type(open) == "boolean" and not open then terminate = true end
+
+    ImGui.Text("Output Directory:")
+    local od = ImGui.InputText("##outdir", outputDir, 512)
+    if type(od) == "string" then outputDir = od; saveSettings() end
+    
+    if ImGui.Button("Use MQ Logs") then outputDir = mqLogs(); saveSettings() end
+    tooltip("Set output directory to MacroQuest Logs folder")
+    
+    ImGui.SameLine()
+    
+    if ImGui.Button("Use Script Dir") then outputDir = scriptDir(); saveSettings() end
+    tooltip("Set output directory to MacroQuest root folder")
+
+    ImGui.Separator()
+    ImGui.Text("Level Range")
+    local mn = ImGui.SliderInt("Min Level", filterMinLevel, 0, charLevel)
+    if type(mn) == "number" then filterMinLevel = mn; saveSettings() end
+    local mx = ImGui.SliderInt("Max Level", filterMaxLevel, 0, charLevel)
+    if type(mx) == "number" then filterMaxLevel = mx; saveSettings() end
+
+    local g = ImGui.Checkbox("Display missing spells in GUI", showInGUI)
+    if type(g) == "boolean" then showInGUI = g; saveSettings() end
+    tooltip("Show the list of missing spells in the window below after scanning")
+
+    local c = ImGui.Checkbox("Export missing spells to CSV", exportCSV)
+    if type(c) == "boolean" then exportCSV = c; saveSettings() end
+    tooltip("Automatically export results to a CSV file when scan completes")
+
+    local h = ImGui.Checkbox("Hide spellbook spells (show abilities / disciplines)", hideSpellbook)
+    if type(h) == "boolean" then hideSpellbook = h; saveSettings() end
+    tooltip("Filter out regular spellbook spells, showing only abilities and disciplines")
+
+    ImGui.Separator()
+
+    if scanning then
+        ImGui.Text("Scanning... ETA: " .. ETA())
+    elseif scan_complete then
+        ImGui.Text(string.format(
+            "Scan complete for %s. Missing: %d",
+            getCharName(), missingCount
+        ))
+        if ImGui.Button("Re-Export CSV") then exportToCSV() end
+        tooltip("Export the current results to a new CSV file")
+    else
+        if ImGui.Button("Find Missing Spells") then startScan() end
+        tooltip("Begin scanning all spells to find missing abilities and spells")
+        
+        ImGui.SameLine()
+        
+        if ImGui.Button("Close") then terminate = true end
+        tooltip("Close SpellExport and save settings")
+    end
+
+    if showInGUI and scan_complete then
+        ImGui.Separator()
+        ImGui.BeginChild("results", 0, 300, true)
+        for _, s in ipairs(missingSpells) do
+            ImGui.Text(string.format("[%d] Lv%d - %s", s.id, s.level, s.name))
+        end
+        ImGui.EndChild()
+    end
+
+    ImGui.End()
+end
+
+-----------------------------
+-- Main
+-----------------------------
+loadSettings()
+refreshCharacterState()
+
+mq.imgui.init(SCRIPT_NAME, drawGUI)
+
+while mq.TLO.MacroQuest.GameState() == "INGAME" and not terminate do
+    if scanning then processBatch() end
+    mq.delay(DELAY_MS)
+end
+
+saveSettings()
+mq.imgui.destroy(SCRIPT_NAME)
+print(string.format("[%s] Closed.", SCRIPT_NAME))
