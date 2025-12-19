@@ -130,9 +130,68 @@ Hover over any button or checkbox for detailed explanations of functionality.
 - Ensure output directory is writable
 - Check for file permission issues
 
-## Version History
+# SpellExport Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
+## [v1.4.0] - 2025-12-19
+
+### Removed
+- Removed ability type labels feature (non-functional in GUI display)
+- Removed `showTypeLabels` checkbox and associated UI controls
+- Removed type labels from GUI spell list display
+
+### Notes
+- Type classification still used internally for "Hide spellbook spells" filter
+- GUI now displays clean format: `[ID] LvLevel - Name`
+
+---
+
+## [v1.3.0] - 2025-12-19
+
+### Added
+- Tooltips for all buttons and checkboxes
+- Hover text explains functionality of each control
+
+### Changed
+- Improved user experience with contextual help text
+
+---
+
+## [v1.2.0] - 2025-12-19
+
+### Removed
+- Removed `Type` column from CSV export
+- CSV now exports only: `ID,Name,Level`
+
+### Notes
+- Type classification preserved internally for filtering
+- GUI display still supports type-based filtering
+
+---
+
+## [v1.1.0] - Initial Release
+
+### Added
+- Ability type classification (Spell / Discipline / Ability / Hybrid)
+- Type column included in CSV export
+- "Hide spellbook spells" filter
+- Display type labels toggle
+- Persistent settings across sessions
+
+### Features
+- Scan all spell IDs (1-30000) for missing spells and abilities
+- Filter by level range (Min/Max)
+- Real-time progress display with ETA calculation
+- Configurable output directory (MQ Logs or Script Dir)
+- CSV export with timestamp
+- GUI display of missing spells
+- Settings persistence in `SpellExport_settings.lua`
+
+### Technical
+- Deterministic batch scanning (150 spells per batch)
+- Safe file I/O with error handling
+- EMU-safe TLO usage
+- Project Lazarus MQNext compatible
+- ImGui interface with Lazarus-safe patterns
 
 ## Current Version
 
