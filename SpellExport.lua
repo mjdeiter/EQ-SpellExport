@@ -1,32 +1,24 @@
 -- ======================================================================
--- SpellExport v1.5.1
+-- SpellExport v1.6.0
 -- Project Lazarus Spell Export Tool
 --
+-- v1.6.0
+--  • Persistent spell cache (builds once, saves forever)
+--  • Background cache building with progress bar
+--  • Cache stats panel
+--  • Schema migrator for cache versioning
+--  • Dual window close behavior (hide vs exit)
 -- v1.5.1
---  • Added spell cache for instant lookup (no lag)
---  • Cache builds on first search or via manual button
--- v1.5.0
---  • Added spell lookup feature with active fuzzy search
---  • Display class levels for looked-up spells
--- v1.4.0
---  • Removed ability type labels feature (non-functional)
--- v1.3.0
---  • Added tooltips for all buttons and checkboxes
--- v1.2.0
---  • Removed Type column from CSV export
--- v1.1.0
---  • Ability type labeling (Spell / Discipline / Ability / Hybrid)
---  • Type column always included in CSV
---  • Hide spellbook spells filter
---  • Filters apply to GUI and CSV consistently
---  • Clear, locked checkbox labels
+--  • Spell lookup with fuzzy search
+--  • Missing spells scanner with level filters
+--  • CSV export capability
 -- ======================================================================
 
 -----------------------------
 -- Script Identity
 -----------------------------
 local SCRIPT_NAME    = "SpellExport"
-local SCRIPT_VERSION = "v1.5.1"
+local SCRIPT_VERSION = "v1.6.0"
 
 -----------------------------
 -- Libraries
@@ -39,10 +31,11 @@ local ImGui = require('ImGui')
 -----------------------------
 local MAX_SPELL_ID  = 30000
 local SCAN_BATCH    = 150
+local CACHE_BATCH   = 500
 local DELAY_MS      = 1
-local SETTINGS_FILE = "SpellExport_settings.lua"
 local MAX_LOOKUP_RESULTS = 20
-local CACHE_BATCH_SIZE = 500
+
+local CACHE_SCHEMA_VERSION = 1
 
 -----------------------------
 -- Class Names
@@ -67,11 +60,28 @@ local CLASS_NAMES = {
 }
 
 -----------------------------
+-- Cache FSM States
+-----------------------------
+local CACHE_STATE = {
+    IDLE = "IDLE",
+    BUILDING = "BUILDING",
+    COMPLETE = "COMPLETE",
+    ERROR = "ERROR"
+}
+
+-----------------------------
 -- State
 -----------------------------
-local scanning, scan_complete, terminate = false, false, false
-local currentScanID, scanStartTime = 1, 0
-local spellsProcessed, missingCount = 0, 0
+local showUI = true
+local terminate = false
+
+-- Missing Spells Scanner State
+local scanning = false
+local scan_complete = false
+local currentScanID = 1
+local scanStartTime = 0
+local spellsProcessed = 0
+local missingCount = 0
 local missingSpells = {}
 
 -- Spell Lookup State
@@ -82,11 +92,16 @@ local selectedSpellData = nil
 local lastLookupChoice = nil
 local lastProcessedQuery = ""
 
--- Spell Cache
-local spellCache = {}
-local cacheBuilt = false
-local cacheBuilding = false
+-- Spell Cache State
+local cacheState = CACHE_STATE.IDLE
 local cacheProgress = 0
+local currentCacheID = 1
+local spellCache = {}
+local cacheStats = {
+    totalSpells = 0,
+    lastBuildTime = "Never",
+    schemaVersion = 0
+}
 
 -----------------------------
 -- Helpers
@@ -110,6 +125,13 @@ local function normalizePath(p)
     return p
 end
 
+local function getConfigDir()
+    if mq.configDir then return mq.configDir end
+    local p = mq.TLO.MacroQuest.Path('config')
+    if p and p() and p() ~= '' then return p() end
+    return '.'
+end
+
 local function mqLogs()
     return tostring(mq.TLO.MacroQuest.Path() or ".") .. "/Logs/"
 end
@@ -131,9 +153,17 @@ local function tooltip(text)
 end
 
 -----------------------------
+-- File Paths
+-----------------------------
+local CONFIG_DIR = getConfigDir()
+local CACHE_FILE = CONFIG_DIR .. "/SpellExport_cache.lua"
+local SETTINGS_FILE = CONFIG_DIR .. "/SpellExport_settings.lua"
+
+-----------------------------
 -- Dynamic Character State
 -----------------------------
-local classID, charLevel = 0, 1
+local classID = 0
+local charLevel = 1
 
 local function refreshCharacterState()
     classID   = tonum(safe(function() return mq.TLO.Me.Class.ID() end))
@@ -145,46 +175,209 @@ end
 -----------------------------
 local filterMinLevel = 0
 local filterMaxLevel = 1
-
-local showInGUI      = true
-local exportCSV      = true
-local hideSpellbook  = false
-
+local showInGUI = true
+local exportCSV = true
+local hideSpellbook = false
 local outputDir = mqLogs()
+local allowBackgroundCache = true
 
 -----------------------------
--- Settings
+-- Safe File I/O
 -----------------------------
-local function settingsPath()
-    return normalizePath(outputDir) .. SETTINGS_FILE
+local function loadLuaTable(path)
+    local f = loadfile(path)
+    if not f then return nil end
+    local ok, data = pcall(f)
+    if ok and type(data) == "table" then
+        return data
+    end
+    return nil
 end
 
+local function writeLuaTable(path, tbl)
+    local f = io.open(path, "w")
+    if not f then return false end
+    
+    local function serialize(v, indent)
+        indent = indent or 0
+        local istr = string.rep("  ", indent)
+        
+        if type(v) == "number" or type(v) == "boolean" then
+            return tostring(v)
+        elseif type(v) == "string" then
+            return string.format("%q", v)
+        elseif type(v) == "table" then
+            local lines = {"{"}
+            for k, val in pairs(v) do
+                local key
+                if type(k) == "string" and k:match("^[%a_][%w_]*$") then
+                    key = k
+                else
+                    key = "[" .. serialize(k) .. "]"
+                end
+                table.insert(lines, istr .. "  " .. key .. " = " .. serialize(val, indent + 1) .. ",")
+            end
+            table.insert(lines, istr .. "}")
+            return table.concat(lines, "\n")
+        end
+        return "nil"
+    end
+    
+    f:write("return ")
+    f:write(serialize(tbl))
+    f:write("\n")
+    f:close()
+    return true
+end
+
+-----------------------------
+-- Settings Persistence
+-----------------------------
 local function loadSettings()
-    local f = loadfile(settingsPath())
-    if not f then return end
-    local ok, d = pcall(f)
-    if ok and type(d) == "table" then
-        filterMinLevel = tonum(d.minLevel)
-        filterMaxLevel = tonum(d.maxLevel)
-        showInGUI      = d.showInGUI ~= false
-        exportCSV      = d.exportCSV ~= false
-        hideSpellbook  = d.hideSpellbook == true
-        outputDir      = d.outputDir or outputDir
+    local data = loadLuaTable(SETTINGS_FILE)
+    if not data then return end
+    
+    filterMinLevel = tonum(data.minLevel or filterMinLevel)
+    filterMaxLevel = tonum(data.maxLevel or filterMaxLevel)
+    showInGUI = (data.showInGUI ~= false)
+    exportCSV = (data.exportCSV ~= false)
+    hideSpellbook = (data.hideSpellbook == true)
+    allowBackgroundCache = (data.allowBackgroundCache ~= false)
+    
+    if data.outputDir then
+        outputDir = data.outputDir
     end
 end
 
 local function saveSettings()
-    local f = io.open(settingsPath(), "w")
-    if not f then return end
-    f:write("return {\n")
-    f:write(string.format(" minLevel=%d,\n", filterMinLevel))
-    f:write(string.format(" maxLevel=%d,\n", filterMaxLevel))
-    f:write(string.format(" showInGUI=%s,\n", tostring(showInGUI)))
-    f:write(string.format(" exportCSV=%s,\n", tostring(exportCSV)))
-    f:write(string.format(" hideSpellbook=%s,\n", tostring(hideSpellbook)))
-    f:write(string.format(" outputDir=%q,\n", normalizePath(outputDir)))
-    f:write("}\n")
-    f:close()
+    local data = {
+        minLevel = filterMinLevel,
+        maxLevel = filterMaxLevel,
+        showInGUI = showInGUI,
+        exportCSV = exportCSV,
+        hideSpellbook = hideSpellbook,
+        allowBackgroundCache = allowBackgroundCache,
+        outputDir = normalizePath(outputDir)
+    }
+    
+    writeLuaTable(SETTINGS_FILE, data)
+end
+
+-----------------------------
+-- Cache Persistence
+-----------------------------
+local function loadCache()
+    local data = loadLuaTable(CACHE_FILE)
+    if not data then return false end
+    
+    -- Schema migration
+    if not data.schemaVersion or data.schemaVersion < CACHE_SCHEMA_VERSION then
+        print(string.format("[%s] Cache schema outdated, rebuilding...", SCRIPT_NAME))
+        return false
+    end
+    
+    if not data.spells or type(data.spells) ~= "table" then
+        return false
+    end
+    
+    spellCache = data.spells
+    cacheStats.totalSpells = #spellCache
+    cacheStats.lastBuildTime = data.buildTime or "Unknown"
+    cacheStats.schemaVersion = data.schemaVersion or 0
+    
+    cacheState = CACHE_STATE.COMPLETE
+    
+    print(string.format("[%s] Loaded spell cache: %d spells", SCRIPT_NAME, #spellCache))
+    return true
+end
+
+local function saveCache()
+    local data = {
+        schemaVersion = CACHE_SCHEMA_VERSION,
+        buildTime = os.date("%Y-%m-%d %H:%M:%S"),
+        spells = spellCache
+    }
+    
+    if writeLuaTable(CACHE_FILE, data) then
+        cacheStats.lastBuildTime = data.buildTime
+        cacheStats.schemaVersion = CACHE_SCHEMA_VERSION
+        print(string.format("[%s] Spell cache saved: %d spells", SCRIPT_NAME, #spellCache))
+        return true
+    end
+    
+    return false
+end
+
+-----------------------------
+-- Cache Building FSM
+-----------------------------
+local function startCacheBuilding()
+    if cacheState == CACHE_STATE.BUILDING or cacheState == CACHE_STATE.COMPLETE then
+        return
+    end
+    
+    spellCache = {}
+    currentCacheID = 1
+    cacheProgress = 0
+    cacheState = CACHE_STATE.BUILDING
+    
+    print(string.format("[%s] Building spell cache...", SCRIPT_NAME))
+end
+
+local function buildCacheBatch()
+    if cacheState ~= CACHE_STATE.BUILDING then return end
+    
+    local endID = math.min(currentCacheID + CACHE_BATCH - 1, MAX_SPELL_ID)
+    
+    for id = currentCacheID, endID do
+        local sp = safe(function() return mq.TLO.Spell(id) end)
+        if sp and sp.ID() and sp.ID() ~= 0 then
+            local name = sp.Name()
+            if name and name ~= "" then
+                local minLevel = 255
+                for cid = 1, 16 do
+                    local lvl = tonum(sp.Level(cid)())
+                    if lvl > 0 and lvl < minLevel and lvl < 255 then
+                        minLevel = lvl
+                    end
+                end
+                
+                table.insert(spellCache, {
+                    id = id,
+                    name = name,
+                    nameLower = name:lower(),
+                    minLevel = minLevel < 255 and minLevel or nil
+                })
+            end
+        end
+    end
+    
+    currentCacheID = endID + 1
+    cacheProgress = math.floor((currentCacheID / MAX_SPELL_ID) * 100)
+    
+    if currentCacheID > MAX_SPELL_ID then
+        cacheState = CACHE_STATE.COMPLETE
+        cacheStats.totalSpells = #spellCache
+        
+        print(string.format("[%s] Cache build complete: %d spells", SCRIPT_NAME, #spellCache))
+        
+        if not saveCache() then
+            print(string.format("[%s] WARNING: Failed to save cache to disk", SCRIPT_NAME))
+        end
+    end
+end
+
+local function resetCache()
+    spellCache = {}
+    currentCacheID = 1
+    cacheProgress = 0
+    cacheState = CACHE_STATE.IDLE
+    cacheStats.totalSpells = 0
+    
+    -- Delete cache file
+    os.remove(CACHE_FILE)
+    
+    print(string.format("[%s] Cache cleared", SCRIPT_NAME))
 end
 
 -----------------------------
@@ -222,63 +415,7 @@ local function isKnown(spell)
 end
 
 -----------------------------
--- Spell Cache Building
------------------------------
-local currentCacheID = 1
-
-local function startCacheBuilding()
-    if cacheBuilding or cacheBuilt then return end
-    
-    spellCache = {}
-    cacheBuilding = true
-    cacheBuilt = false
-    currentCacheID = 1
-    cacheProgress = 0
-    
-    print(string.format("[%s] Building spell cache...", SCRIPT_NAME))
-end
-
-local function buildCacheBatch()
-    if not cacheBuilding then return end
-    
-    local endID = math.min(currentCacheID + CACHE_BATCH_SIZE - 1, MAX_SPELL_ID)
-    
-    for id = currentCacheID, endID do
-        local sp = safe(function() return mq.TLO.Spell(id) end)
-        if sp and sp.ID() and sp.ID() ~= 0 then
-            local name = sp.Name()
-            if name and name ~= "" then
-                -- Get minimum level across all classes
-                local minLevel = 255
-                for cid = 1, 16 do
-                    local lvl = tonum(sp.Level(cid)())
-                    if lvl > 0 and lvl < minLevel and lvl < 255 then
-                        minLevel = lvl
-                    end
-                end
-                
-                table.insert(spellCache, {
-                    id = id,
-                    name = name,
-                    nameLower = name:lower(),
-                    minLevel = minLevel < 255 and minLevel or nil
-                })
-            end
-        end
-    end
-    
-    currentCacheID = endID + 1
-    cacheProgress = math.floor((currentCacheID / MAX_SPELL_ID) * 100)
-    
-    if currentCacheID > MAX_SPELL_ID then
-        cacheBuilding = false
-        cacheBuilt = true
-        print(string.format("[%s] Spell cache built: %d spells", SCRIPT_NAME, #spellCache))
-    end
-end
-
------------------------------
--- Fuzzy Matching (from itempass)
+-- Fuzzy Matching
 -----------------------------
 local function levenshtein(a, b)
     a = a or ''
@@ -318,15 +455,10 @@ local function getSpellSuggestions(prefix)
     prefix = trim(prefix)
     if prefix == '' or #prefix < 2 then return {} end
     
-    -- Auto-start cache building on first search
-    if not cacheBuilt and not cacheBuilding then
-        startCacheBuilding()
+    if cacheState ~= CACHE_STATE.COMPLETE then
+        return {}
     end
     
-    -- Don't search until cache is ready
-    if not cacheBuilt then return {} end
-    
-    -- Skip if query hasn't changed
     if prefix == lastProcessedQuery then
         return lookupSuggestions
     end
@@ -335,23 +467,20 @@ local function getSpellSuggestions(prefix)
     local search = prefix:lower()
     local matches = {}
 
-    -- Search the cache instead of live TLO queries
     for _, entry in ipairs(spellCache) do
         local key = entry.nameLower
         
-        -- Scoring
         local score
         local startPos = key:find(search, 1, true)
         if startPos == 1 then
-            score = 0  -- starts with
+            score = 0
         elseif startPos ~= nil then
-            score = 1  -- contains
+            score = 1
         else
             local slice = key:sub(1, #search)
-            score = 2 + levenshtein(search, slice)  -- fuzzy
+            score = 2 + levenshtein(search, slice)
         end
         
-        -- Only include reasonable matches
         if score <= 10 then
             local display = entry.name
             if score == 0 then
@@ -370,7 +499,6 @@ local function getSpellSuggestions(prefix)
         end
     end
 
-    -- Sort by score, then level, then name
     table.sort(matches, function(a, b)
         if a.score ~= b.score then return a.score < b.score end
         if a.minLevel and b.minLevel and a.minLevel ~= b.minLevel then
@@ -379,7 +507,6 @@ local function getSpellSuggestions(prefix)
         return a.name:lower() < b.name:lower()
     end)
 
-    -- Limit results
     local results = {}
     for i = 1, math.min(#matches, MAX_LOOKUP_RESULTS) do
         results[i] = matches[i]
@@ -407,7 +534,6 @@ local function selectSpell(spellID)
     
     for cid = 1, 16 do
         local lvl = tonum(sp.Level(cid)())
-        -- Filter out level 255 (not available) and level 0 (invalid)
         if lvl > 0 and lvl < 255 then
             table.insert(selectedSpellData.classes, {
                 name = CLASS_NAMES[cid] or "Unknown",
@@ -416,20 +542,21 @@ local function selectSpell(spellID)
         end
     end
     
-    -- Sort by level
     table.sort(selectedSpellData.classes, function(a, b)
         return a.level < b.level
     end)
 end
 
 -----------------------------
--- Scan Logic
+-- Missing Spells Scanner
 -----------------------------
 local function resetScan()
-    spellsProcessed, missingCount = 0, 0
+    spellsProcessed = 0
+    missingCount = 0
     missingSpells = {}
     currentScanID = 1
-    scanning, scan_complete = false, false
+    scanning = false
+    scan_complete = false
 end
 
 local function startScan()
@@ -462,7 +589,10 @@ local function processBatch()
                     if not (hideSpellbook and t == "Spell") then
                         missingCount = missingCount + 1
                         table.insert(missingSpells, {
-                            id=id, name=sp.Name(), level=lvl, type=t
+                            id = id,
+                            name = sp.Name(),
+                            level = lvl,
+                            type = t
                         })
                     end
                 end
@@ -525,7 +655,7 @@ function exportToCSV()
 end
 
 -----------------------------
--- ETA
+-- ETA Calculation
 -----------------------------
 local function ETA()
     if not scanning or spellsProcessed == 0 then return "Calculating..." end
@@ -539,26 +669,70 @@ end
 -- GUI
 -----------------------------
 local function drawGUI()
-    local _, open = ImGui.Begin(SCRIPT_NAME .. " " .. SCRIPT_VERSION, true)
-    if type(open) == "boolean" and not open then terminate = true end
+    if not showUI then return end
+    
+    local open = ImGui.Begin(SCRIPT_NAME .. " " .. SCRIPT_VERSION, true)
+    if not open then
+        showUI = false
+        ImGui.End()
+        return
+    end
+
+    -- Cache Stats Panel
+    if ImGui.CollapsingHeader("Cache Status", ImGuiTreeNodeFlags.DefaultOpen) then
+        local stateColor = {1, 1, 1, 1}
+        local stateText = "Unknown"
+        
+        if cacheState == CACHE_STATE.IDLE then
+            stateColor = {1, 0.5, 0, 1}
+            stateText = "Not Built"
+        elseif cacheState == CACHE_STATE.BUILDING then
+            stateColor = {1, 1, 0, 1}
+            stateText = string.format("Building... %d%%", cacheProgress)
+        elseif cacheState == CACHE_STATE.COMPLETE then
+            stateColor = {0, 1, 0, 1}
+            stateText = "Ready"
+        elseif cacheState == CACHE_STATE.ERROR then
+            stateColor = {1, 0, 0, 1}
+            stateText = "Error"
+        end
+        
+        ImGui.Text("Status:")
+        ImGui.SameLine()
+        ImGui.TextColored(stateColor[1], stateColor[2], stateColor[3], stateColor[4], stateText)
+        
+        ImGui.Text(string.format("Total Spells: %d", cacheStats.totalSpells))
+        ImGui.Text(string.format("Last Build: %s", cacheStats.lastBuildTime))
+        ImGui.Text(string.format("Schema: v%d", cacheStats.schemaVersion))
+        
+        if cacheState == CACHE_STATE.IDLE or cacheState == CACHE_STATE.ERROR then
+            if ImGui.Button("Build Cache##build") then
+                startCacheBuilding()
+            end
+            tooltip("Build spell database cache for instant search")
+        elseif cacheState == CACHE_STATE.COMPLETE then
+            if ImGui.Button("Rebuild Cache##rebuild") then
+                resetCache()
+                startCacheBuilding()
+            end
+            tooltip("Clear and rebuild spell cache from scratch")
+        end
+        
+        ImGui.SameLine()
+        
+        local bg = ImGui.Checkbox("Background Build##bgcache", allowBackgroundCache)
+        if type(bg) == "boolean" then
+            allowBackgroundCache = bg
+            saveSettings()
+        end
+        tooltip("Allow cache to build while window is hidden")
+    end
+    
+    ImGui.Separator()
 
     -- Spell Lookup Section
     if ImGui.CollapsingHeader("Spell Lookup", ImGuiTreeNodeFlags.DefaultOpen) then
         ImGui.Text("Search for spell:")
-        
-        -- Cache status
-        if cacheBuilding then
-            ImGui.TextColored(1, 1, 0, 1, string.format("Building cache... %d%%", cacheProgress))
-        elseif not cacheBuilt then
-            ImGui.TextColored(1, 0.5, 0, 1, "Cache not built")
-            ImGui.SameLine()
-            if ImGui.Button("Build Cache##buildcache") then
-                startCacheBuilding()
-            end
-            tooltip("Build spell database cache for instant search")
-        else
-            ImGui.TextColored(0, 1, 0, 1, string.format("Cache ready (%d spells)", #spellCache))
-        end
         
         local query = ImGui.InputText("##lookup", lookupQuery, 256)
         if type(query) == "string" then
@@ -577,12 +751,10 @@ local function drawGUI()
         end
         tooltip("Clear search and selection")
         
-        -- Generate suggestions as user types (from cache)
-        if cacheBuilt then
+        if cacheState == CACHE_STATE.COMPLETE then
             lookupSuggestions = getSpellSuggestions(lookupQuery)
         end
         
-        -- Active autocomplete dropdown
         local chosen = nil
         if #lookupSuggestions > 0 then
             local hint = string.format('%d match%s', 
@@ -610,11 +782,12 @@ local function drawGUI()
                 end
                 ImGui.EndCombo()
             end
-        elseif lookupQuery ~= "" and #lookupQuery >= 2 and cacheBuilt then
+        elseif lookupQuery ~= "" and #lookupQuery >= 2 and cacheState == CACHE_STATE.COMPLETE then
             ImGui.TextDisabled('(no matches)')
+        elseif cacheState ~= CACHE_STATE.COMPLETE and lookupQuery ~= "" then
+            ImGui.TextColored(1, 0.5, 0, 1, "Cache not ready - build cache first")
         end
         
-        -- Apply choice once
         if chosen and chosen ~= lastLookupChoice then
             selectSpell(chosen)
             lastLookupChoice = chosen
@@ -622,7 +795,6 @@ local function drawGUI()
             lastLookupChoice = nil
         end
         
-        -- Display selected spell details
         if selectedSpellData and selectedSpellData.classes then
             ImGui.Separator()
             ImGui.Text(string.format(
@@ -646,37 +818,63 @@ local function drawGUI()
     
     ImGui.Separator()
 
-    -- Existing Missing Spells Scanner Section
+    -- Missing Spells Scanner Section
     if ImGui.CollapsingHeader("Missing Spells Scanner", ImGuiTreeNodeFlags.DefaultOpen) then
         ImGui.Text("Output Directory:")
         local od = ImGui.InputText("##outdir", outputDir, 512)
-        if type(od) == "string" then outputDir = od; saveSettings() end
+        if type(od) == "string" then
+            outputDir = od
+            saveSettings()
+        end
         
-        if ImGui.Button("Use MQ Logs") then outputDir = mqLogs(); saveSettings() end
+        if ImGui.Button("Use MQ Logs") then
+            outputDir = mqLogs()
+            saveSettings()
+        end
         tooltip("Set output directory to MacroQuest Logs folder")
         
         ImGui.SameLine()
         
-        if ImGui.Button("Use Script Dir") then outputDir = scriptDir(); saveSettings() end
+        if ImGui.Button("Use Script Dir") then
+            outputDir = scriptDir()
+            saveSettings()
+        end
         tooltip("Set output directory to MacroQuest root folder")
 
         ImGui.Separator()
         ImGui.Text("Level Range")
+        
         local mn = ImGui.SliderInt("Min Level", filterMinLevel, 0, charLevel)
-        if type(mn) == "number" then filterMinLevel = mn; saveSettings() end
+        if type(mn) == "number" then
+            filterMinLevel = mn
+            saveSettings()
+        end
+        
         local mx = ImGui.SliderInt("Max Level", filterMaxLevel, 0, charLevel)
-        if type(mx) == "number" then filterMaxLevel = mx; saveSettings() end
+        if type(mx) == "number" then
+            filterMaxLevel = mx
+            saveSettings()
+        end
 
         local g = ImGui.Checkbox("Display missing spells in GUI", showInGUI)
-        if type(g) == "boolean" then showInGUI = g; saveSettings() end
+        if type(g) == "boolean" then
+            showInGUI = g
+            saveSettings()
+        end
         tooltip("Show the list of missing spells in the window below after scanning")
 
         local c = ImGui.Checkbox("Export missing spells to CSV", exportCSV)
-        if type(c) == "boolean" then exportCSV = c; saveSettings() end
+        if type(c) == "boolean" then
+            exportCSV = c
+            saveSettings()
+        end
         tooltip("Automatically export results to a CSV file when scan completes")
 
         local h = ImGui.Checkbox("Hide spellbook spells (show abilities / disciplines)", hideSpellbook)
-        if type(h) == "boolean" then hideSpellbook = h; saveSettings() end
+        if type(h) == "boolean" then
+            hideSpellbook = h
+            saveSettings()
+        end
         tooltip("Filter out regular spellbook spells, showing only abilities and disciplines")
 
         ImGui.Separator()
@@ -688,10 +886,14 @@ local function drawGUI()
                 "Scan complete for %s. Missing: %d",
                 getCharName(), missingCount
             ))
-            if ImGui.Button("Re-Export CSV") then exportToCSV() end
+            if ImGui.Button("Re-Export CSV") then
+                exportToCSV()
+            end
             tooltip("Export the current results to a new CSV file")
         else
-            if ImGui.Button("Find Missing Spells") then startScan() end
+            if ImGui.Button("Find Missing Spells") then
+                startScan()
+            end
             tooltip("Begin scanning all spells to find missing abilities and spells")
         end
 
@@ -706,26 +908,74 @@ local function drawGUI()
     end
     
     ImGui.Separator()
-    if ImGui.Button("Close") then terminate = true end
-    tooltip("Close SpellExport and save settings")
+    
+    if ImGui.Button("Exit Script") then
+        terminate = true
+    end
+    tooltip("Close SpellExport completely and save settings")
 
     ImGui.End()
 end
 
 -----------------------------
--- Main
+-- Command Handler
 -----------------------------
+local function handleCommand(...)
+    local args = {...}
+    local cmd = args[1] and args[1]:lower() or ""
+    
+    if cmd == "gui" or cmd == "show" then
+        showUI = true
+        print(string.format("[%s] GUI shown", SCRIPT_NAME))
+    elseif cmd == "hide" then
+        showUI = false
+        print(string.format("[%s] GUI hidden", SCRIPT_NAME))
+    elseif cmd == "exit" or cmd == "quit" then
+        terminate = true
+        print(string.format("[%s] Exiting...", SCRIPT_NAME))
+    elseif cmd == "buildcache" then
+        startCacheBuilding()
+    elseif cmd == "resetcache" then
+        resetCache()
+    else
+        print(string.format("[%s] Commands: gui, hide, exit, buildcache, resetcache", SCRIPT_NAME))
+    end
+end
+
+mq.bind('/spellexport', handleCommand)
+
+-----------------------------
+-- Initialization
+-----------------------------
+print(string.format("[%s] %s starting...", SCRIPT_NAME, SCRIPT_VERSION))
+
 loadSettings()
 refreshCharacterState()
 
+if not loadCache() then
+    print(string.format("[%s] No cache found - build cache for spell lookup", SCRIPT_NAME))
+end
+
 mq.imgui.init(SCRIPT_NAME, drawGUI)
 
+-----------------------------
+-- Main Loop
+-----------------------------
 while mq.TLO.MacroQuest.GameState() == "INGAME" and not terminate do
-    if scanning then processBatch() end
-    if cacheBuilding then buildCacheBatch() end
+    if scanning then
+        processBatch()
+    end
+    
+    if cacheState == CACHE_STATE.BUILDING and (showUI or allowBackgroundCache) then
+        buildCacheBatch()
+    end
+    
     mq.delay(DELAY_MS)
 end
 
+-----------------------------
+-- Shutdown
+-----------------------------
 saveSettings()
 mq.imgui.destroy(SCRIPT_NAME)
 print(string.format("[%s] Closed.", SCRIPT_NAME))
