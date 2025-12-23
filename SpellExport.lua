@@ -1,7 +1,11 @@
 -- ======================================================================
--- SpellExport v1.6.0
+-- SpellExport v1.6.1
 -- Project Lazarus Spell Export Tool
 --
+-- v1.6.1
+--  • Added "Known Status" display in spell lookup
+--  • Shows if character has/knows the selected spell
+--  • Color-coded status (green=known, red=missing)
 -- v1.6.0
 --  • Persistent spell cache (builds once, saves forever)
 --  • Background cache building with progress bar
@@ -18,7 +22,7 @@
 -- Script Identity
 -----------------------------
 local SCRIPT_NAME    = "SpellExport"
-local SCRIPT_VERSION = "v1.6.0"
+local SCRIPT_VERSION = "v1.6.1"
 
 -----------------------------
 -- Libraries
@@ -484,9 +488,9 @@ local function getSpellSuggestions(prefix)
         if score <= 10 then
             local display = entry.name
             if score == 0 then
-                display = '★ ' .. entry.name
+                display = '* ' .. entry.name
             elseif score == 1 then
-                display = '• ' .. entry.name
+                display = '- ' .. entry.name
             end
             
             table.insert(matches, {
@@ -531,6 +535,10 @@ local function selectSpell(spellID)
     selectedSpellData.name = sp.Name()
     selectedSpellData.id = spellID
     selectedSpellData.classes = {}
+    
+    -- Check if character knows this spell
+    selectedSpellData.isKnown = isKnown(sp)
+    selectedSpellData.type = classify(sp)
     
     for cid = 1, 16 do
         local lvl = tonum(sp.Level(cid)())
@@ -795,6 +803,7 @@ local function drawGUI()
             lastLookupChoice = nil
         end
         
+        -- Display selected spell details
         if selectedSpellData and selectedSpellData.classes then
             ImGui.Separator()
             ImGui.Text(string.format(
@@ -802,6 +811,17 @@ local function drawGUI()
                 selectedSpellData.name,
                 selectedSpellData.id
             ))
+            
+            -- Known Status Display
+            ImGui.Text("Status:")
+            ImGui.SameLine()
+            if selectedSpellData.isKnown then
+                ImGui.TextColored(0, 1, 0, 1, "[KNOWN]")
+                ImGui.SameLine()
+                ImGui.TextDisabled(string.format("(%s)", selectedSpellData.type))
+            else
+                ImGui.TextColored(1, 0, 0, 1, "[NOT LEARNED]")
+            end
             
             if #selectedSpellData.classes > 0 then
                 ImGui.Text("Available to:")
