@@ -6,6 +6,9 @@ A comprehensive spell, discipline, and ability auditing tool for the **Project L
 
 SpellExport identifies which abilities your character is missing within a configurable level range and provides a fast, non-invasive spell lookup tool for reference and planning.
 
+<img width="344" height="557" alt="image" src="https://github.com/user-attachments/assets/b692b34d-9d6d-467f-8bea-6104fdb93095" />
+
+
 ---
 
 ## Overview
