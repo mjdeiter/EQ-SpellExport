@@ -1,5 +1,7 @@
 # SpellExport
 
+A [MacroQuest](https://www.macroquest.org/) Lua script for the [Project Lazarus](https://www.lazaruseq.com/) EverQuest emulator server.
+
 [![Support](https://img.shields.io/badge/Support-Buy%20Me%20a%20Coffee-6f4e37)](https://buymeacoffee.com/shablagu)
 
 A comprehensive spell, discipline, and ability auditing tool for the **Project Lazarus EverQuest EMU server**.
